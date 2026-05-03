@@ -1,0 +1,277 @@
+--- a/Modules/input_parameters.f90
++++ b/Modules/input_parameters.f90
+@@ -477,6 +477,7 @@
+         LOGICAL  :: lspinorb = .false.
+         LOGICAL  :: lforcet=.FALSE.
+         LOGICAL  :: starting_spin_angle=.FALSE.
++        REAL(DP) :: soc_scale = 1.0_DP
+         REAL(DP) :: lambda = 1.0_DP
+         REAL(DP) :: fixed_magnetization(3) = 0.0_DP
+         REAL(DP) :: angle1(nsx) = 0.0_DP
+@@ -639,8 +640,8 @@
+              scdmden, scdmgrd, nscdm, n_proj,                                 &
+              exxdiv_treatment, x_gamma_extrapolation, yukawa, ecutvcut,       &
+              exx_fraction, screening_parameter, ref_alat,                     &
+-             noncolin, lspinorb, starting_spin_angle, lambda, angle1, angle2, &
+-             report, lforcet,                                                 &
++             noncolin, lspinorb, starting_spin_angle, soc_scale, lambda,      &
++             angle1, angle2, report, lforcet,                                 &
+              constrained_magnetization, B_field, fixed_magnetization,         &
+              sic, sic_epsilon, force_pairing, sic_alpha,                      &
+              tot_charge, tot_magnetization, spline_ps, one_atom_occupations,  &
+--- a/Modules/read_namelists.f90
++++ b/Modules/read_namelists.f90
+@@ -264,6 +264,7 @@
+        lforcet = .FALSE.
+        starting_spin_angle=.FALSE.
+        noncolin = .FALSE.
++       soc_scale = 1.0_DP
+        lambda = 1.0_DP
+        constrained_magnetization= 'none'
+        fixed_magnetization = 0.0_DP
+@@ -874,6 +875,7 @@
+        CALL mp_bcast( lforcet,                   ionode_id, intra_image_comm )
+        CALL mp_bcast( starting_spin_angle,       ionode_id, intra_image_comm )
+        CALL mp_bcast( noncolin,                  ionode_id, intra_image_comm )
++       CALL mp_bcast( soc_scale,                 ionode_id, intra_image_comm )
+        CALL mp_bcast( angle1,                    ionode_id, intra_image_comm )
+        CALL mp_bcast( angle2,                    ionode_id, intra_image_comm )
+        CALL mp_bcast( report,                    ionode_id, intra_image_comm )
+--- a/PW/src/input.f90
++++ b/PW/src/input.f90
+@@ -195,7 +195,8 @@
+   !
+   USE spin_orb, ONLY : lspinorb_ => lspinorb,  &
+                        lforcet_ => lforcet,    &
+-                       starting_spin_angle_ => starting_spin_angle
++                       starting_spin_angle_ => starting_spin_angle, &
++                       soc_scale_ => soc_scale
+ 
+   !
+   USE symm_base, ONLY : no_t_rev_ => no_t_rev, nofrac, allfrac, &
+@@ -259,7 +260,8 @@
+                                edir, emaxpos, eopreg, eamp, noncolin, lambda, &
+                                angle1, angle2, constrained_magnetization,     &
+                                B_field, fixed_magnetization, report, lspinorb,&
+-                               starting_spin_angle, assume_isolated,spline_ps,&
++                               starting_spin_angle, soc_scale,                &
++                               assume_isolated,spline_ps,&
+                                vdw_corr, london, london_s6, london_rcut, london_c6, &
+                                london_rvdw, dftd3_threebody, dftd3_version,   &
+                                ts_vdw, ts_vdw_isolated, ts_vdw_econv_thr,     &
+@@ -699,6 +701,8 @@
+   noncolin_ = noncolin
+   lspinorb_ = lspinorb
+   lforcet_ = lforcet
++  IF ( soc_scale < 0.0_DP ) CALL errore( 'iosys', 'soc_scale must be >= 0', 1 )
++  soc_scale_ = soc_scale
+   !
+   SELECT CASE( trim( constrained_magnetization ) )
+   CASE( 'none' )
+--- a/PW/src/pwcom.f90
++++ b/PW/src/pwcom.f90
+@@ -482,12 +482,23 @@
+   !! if .TRUE. apply Force Theorem to calculate MAE 
+   LOGICAL :: starting_spin_angle
+   !! if .TRUE. the initial wavefunctions are spin-angle functions. 
++  REAL(DP) :: soc_scale = 1.0_DP
++  !! scale factor for the j-resolved SOC splitting in FR pseudopotential channels
+   LOGICAL :: domag
+   !! if .TRUE. magnetization is computed
+   COMPLEX (DP) :: rot_ylm(lqmax,lqmax)
+   !! transform real spherical harmonics into complex ones
+   COMPLEX (DP), ALLOCATABLE :: fcoef(:,:,:,:,:)
+   !! function needed to account for spinors.
++  !
++CONTAINS
++  !
++  SUBROUTINE apply_soc_scaling_so( mat )
++    COMPLEX(DP), INTENT(INOUT) :: mat(4)
++
++    ! SOC scaling is now applied earlier, at the pseudopotential-channel level.
++    RETURN
++  END SUBROUTINE apply_soc_scaling_so
+   !
+ END MODULE spin_orb
+ !
+--- a/PW/src/setup.f90
++++ b/PW/src/setup.f90
+@@ -79,7 +79,7 @@
+   USE mp,                 ONLY : mp_bcast
+   USE lsda_mod,           ONLY : lsda, nspin, current_spin, isk, &
+                                  starting_magnetization
+-  USE spin_orb,           ONLY : lspinorb, domag
++  USE spin_orb,           ONLY : lspinorb, domag, soc_scale
+   USE noncollin_module,   ONLY : noncolin, npol, i_cons, m_loc, &
+                                  angle1, angle2, bfield, ux, nspin_lsda, &
+                                  nspin_gga, nspin_mag
+@@ -265,6 +265,7 @@
+   IF ( lspinorb ) THEN
+      IF ( ALL ( .NOT. upf(:)%has_so ) ) &
+           CALL infomsg ('setup','At least one non s.o. pseudo')
++     IF ( ABS( soc_scale - 1.0_DP ) >= 1.0D-12 ) CALL scale_soc_pp( ntyp, soc_scale )
+   ELSE
+      CALL average_pp ( ntyp )
+   END IF
+--- a/PW/src/read_file_new.f90
++++ b/PW/src/read_file_new.f90
+@@ -155,7 +155,7 @@
+   USE wvfct,                ONLY : nbnd, nbndx, et, wg
+   USE lsda_mod,             ONLY : nspin
+   USE noncollin_module,     ONLY : noncolin
+-  USE spin_orb,             ONLY : lspinorb
++  USE spin_orb,             ONLY : lspinorb, soc_scale
+   USE cell_base,            ONLY : at, bg, set_h_ainv
+   USE symm_base,            ONLY : d1, d2, d3
+   USE realus,               ONLY : betapointlist, generate_qpointlist, &
+@@ -181,8 +181,12 @@
+   ! ... misc PP initialization (from setup.f90)
+   !
+   okpaw = ANY ( upf(1:nsp)%tpawp )
+-  IF ( .NOT. lspinorb ) CALL average_pp ( nsp )
+-  !! average_pp must be called before init_lda_plus_u
++  IF ( .NOT. lspinorb ) THEN
++     CALL average_pp ( nsp )
++  ELSEIF ( ABS( soc_scale - 1.0_DP ) >= 1.0D-12 ) THEN
++     CALL scale_soc_pp( nsp, soc_scale )
++  END IF
++  !! average_pp/scale_soc_pp must be called before init_lda_plus_u
+   IF ( lda_plus_u ) THEN
+      IF (lda_plus_u_kind == 2) CALL read_V
+      CALL init_lda_plus_u ( upf(1:nsp)%psd, nspin, noncolin )
+--- a/PW/src/average_pp.f90
++++ b/PW/src/average_pp.f90
+@@ -152,3 +152,106 @@
+   ENDDO
+   !
+ END SUBROUTINE average_pp
++!
++!----------------------------------------------------------------------------
++SUBROUTINE scale_soc_pp( ntyp, soc_scale )
++  !----------------------------------------------------------------------------
++  !! Scale the spin-orbit splitting at the pseudopotential channel level
++  !! without reducing the number of j=l+-1/2 channels.
++  !
++  USE kinds,            ONLY : DP
++  USE atom,             ONLY : rgrid
++  USE uspp_param,       ONLY : upf
++  !
++  IMPLICIT NONE
++  !
++  INTEGER, INTENT(IN) :: ntyp
++  REAL(DP), INTENT(IN) :: soc_scale
++  !
++  INTEGER :: nt, nbe, ind, ind1, l, mesh
++  REAL(DP) :: vionl, dplus, dminus
++  REAL(DP), ALLOCATABLE :: beta_avg(:), chi_avg(:)
++  !
++  IF ( ABS( soc_scale - 1.0_DP ) < 1.0D-12 ) RETURN
++  !
++  DO nt = 1, ntyp
++     IF ( .NOT. upf(nt)%has_so ) CYCLE
++     IF ( upf(nt)%tvanp ) CALL errore( 'scale_soc_pp', &
++          'soc_scale for FR ultrasoft/PAW pseudopotentials not implemented', 1 )
++     !
++     mesh = rgrid(nt)%mesh
++     ALLOCATE( beta_avg(mesh), chi_avg(mesh) )
++     !
++     nbe = 1
++     DO WHILE ( nbe <= upf(nt)%nbeta )
++        l = upf(nt)%lll(nbe)
++        IF ( l == 0 ) THEN
++           nbe = nbe + 1
++           CYCLE
++        END IF
++        IF ( nbe + 1 > upf(nt)%nbeta ) CALL errore( 'scale_soc_pp', 'wrong beta functions', 1 )
++        !
++        IF ( ABS( upf(nt)%jjj(nbe) - upf(nt)%lll(nbe) + 0.5D0 ) < 1.D-7 ) THEN
++           IF ( ABS( upf(nt)%jjj(nbe+1) - upf(nt)%lll(nbe+1) - 0.5D0 ) > 1.D-7 ) &
++                CALL errore( 'scale_soc_pp', 'wrong beta functions', 2 )
++           ind  = nbe + 1
++           ind1 = nbe
++        ELSE
++           IF ( ABS( upf(nt)%jjj(nbe+1) - upf(nt)%lll(nbe+1) + 0.5D0 ) > 1.D-7 ) &
++                CALL errore( 'scale_soc_pp', 'wrong beta functions', 3 )
++           ind  = nbe
++           ind1 = nbe + 1
++        END IF
++        !
++        dplus  = upf(nt)%dion(ind,ind)
++        dminus = upf(nt)%dion(ind1,ind1)
++        vionl = ( ( l + 1.D0 ) * dplus + l * dminus ) / ( 2.D0 * l + 1.D0 )
++        beta_avg(1:mesh) = 1.D0 / ( 2.D0 * l + 1.D0 ) * &
++             ( ( l + 1.D0 ) * SQRT( dplus / vionl ) * upf(nt)%beta(1:mesh,ind) + &
++               l * SQRT( dminus / vionl ) * upf(nt)%beta(1:mesh,ind1) )
++        !
++        upf(nt)%beta(1:mesh,ind) = beta_avg(1:mesh) + &
++             soc_scale * ( upf(nt)%beta(1:mesh,ind) - beta_avg(1:mesh) )
++        upf(nt)%beta(1:mesh,ind1) = beta_avg(1:mesh) + &
++             soc_scale * ( upf(nt)%beta(1:mesh,ind1) - beta_avg(1:mesh) )
++        upf(nt)%dion(ind,ind) = vionl + soc_scale * ( dplus - vionl )
++        upf(nt)%dion(ind1,ind1) = vionl + soc_scale * ( dminus - vionl )
++        !
++        nbe = nbe + 2
++     END DO
++     !
++     nbe = 1
++     DO WHILE ( nbe <= upf(nt)%nwfc )
++        l = upf(nt)%lchi(nbe)
++        IF ( l == 0 ) THEN
++           nbe = nbe + 1
++           CYCLE
++        END IF
++        IF ( nbe + 1 > upf(nt)%nwfc ) CALL errore( 'scale_soc_pp', 'wrong chi functions', 1 )
++        !
++        IF ( ABS( upf(nt)%jchi(nbe) - upf(nt)%lchi(nbe) + 0.5D0 ) < 1.D-7 ) THEN
++           IF ( ABS( upf(nt)%jchi(nbe+1) - upf(nt)%lchi(nbe+1) - 0.5D0 ) > 1.D-7 ) &
++                CALL errore( 'scale_soc_pp', 'wrong chi functions', 2 )
++           ind  = nbe + 1
++           ind1 = nbe
++        ELSE
++           IF ( ABS( upf(nt)%jchi(nbe+1) - upf(nt)%lchi(nbe+1) + 0.5D0 ) > 1.D-7 ) &
++                CALL errore( 'scale_soc_pp', 'wrong chi functions', 3 )
++           ind  = nbe
++           ind1 = nbe + 1
++        END IF
++        !
++        chi_avg(1:mesh) = ( ( l + 1.D0 ) * upf(nt)%chi(1:mesh,ind) + &
++                            l * upf(nt)%chi(1:mesh,ind1) ) / ( 2.D0 * l + 1.D0 )
++        upf(nt)%chi(1:mesh,ind) = chi_avg(1:mesh) + &
++             soc_scale * ( upf(nt)%chi(1:mesh,ind) - chi_avg(1:mesh) )
++        upf(nt)%chi(1:mesh,ind1) = chi_avg(1:mesh) + &
++             soc_scale * ( upf(nt)%chi(1:mesh,ind1) - chi_avg(1:mesh) )
++        !
++        nbe = nbe + 2
++     END DO
++     !
++     DEALLOCATE( beta_avg, chi_avg )
++  END DO
++  !
++END SUBROUTINE scale_soc_pp
+--- a/PW/Doc/INPUT_PW.def
++++ b/PW/Doc/INPUT_PW.def
+@@ -1523,6 +1523,24 @@
+             info {
+                 if .TRUE. the noncollinear code can use a pseudopotential with
+                 spin-orbit.
++            }
++        }
++
++        var soc_scale -type REAL {
++            default { 1.0 }
++            info {
++                Scales the j=l+/-1/2 splitting of fully-relativistic
++                norm-conserving pseudopotential channels before pw.x builds
++                the SOC matrices.
++
++                soc_scale = 1.0 gives the default QE behaviour.
++                soc_scale = 0.0 collapses each j pair to the same weighted
++                average_pp target while keeping both channels.
++                soc_scale > 1.0 enhances the SOC splitting.
++
++                Used only when @ref noncolin=.TRUE. and @ref lspinorb=.TRUE..
++                For fully-relativistic ultrasoft/PAW pseudopotentials,
++                soc_scale /= 1.0 is not implemented.
+             }
+         }
+         
